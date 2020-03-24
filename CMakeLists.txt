@@ -11,6 +11,7 @@ add_subdirectory(llfio)
 
 add_executable(redo redo.cc)
 target_include_directories(redo PUBLIC
+  include
   fmt/include
   llfio/include
   build/quickcpplib/include
