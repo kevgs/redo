@@ -39,8 +39,6 @@ public:
   void Append(llfio::io_handle::const_buffer_type buf) {
     std::lock_guard<std::mutex> _(mutex_);
 
-    bytes_written_ += buf.size();
-
     if (offset_ + buf.size() > size_) {
       auto partial_size = size_ - offset_;
       llfio::write(fh_, offset_, {{buf.data(), partial_size}}).value();
@@ -51,11 +49,13 @@ public:
 
     llfio::write(fh_, offset_, {buf}).value();
     offset_ = (offset_ + buf.size()) % size_;
+
+    appends_performed_++;
   }
 
-  auto BytesWritten() const {
+  auto AppendsPerformed() const {
     std::lock_guard<std::mutex> _(mutex_);
-    return bytes_written_;
+    return appends_performed_;
   }
 
 private:
@@ -63,7 +63,7 @@ private:
   const llfio::file_handle::extent_type size_;
   llfio::io_handle::extent_type offset_{0};
   mutable std::mutex mutex_;
-  size_t bytes_written_{0};
+  size_t appends_performed_{0};
 };
 
 void ThreadFunction(std::stop_token st, std::byte b, CircularFile &f) {
@@ -111,11 +111,11 @@ int main() {
                          std::ref(cf));
   }
 
-  std::this_thread::sleep_for(1min);
+  std::this_thread::sleep_for(30s);
   for (auto &t : threads)
     t.request_stop();
   for (auto &t : threads)
     t.join();
 
-  fmt::print("Total bytes written: {}\n", cf.BytesWritten());
+  fmt::print("Appends performed: {}\n", cf.AppendsPerformed());
 }
