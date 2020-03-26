@@ -10,6 +10,7 @@
 #include <llfio.hpp>
 
 #include "redo/jthread.hpp"
+#include "redo/span.hpp"
 #include "redo/stop_token.hpp"
 
 namespace llfio = LLFIO_V2_NAMESPACE;
@@ -74,27 +75,16 @@ void ThreadFunction(std::stop_token st, std::byte b, CircularFile &f) {
   std::array<std::byte, 2000> big;
   big.fill(b);
 
+  std::array<tcb::span<std::byte>, 3> buffers{small, medium, big};
+
   std::random_device r;
   std::default_random_engine e1(r());
-  std::uniform_int_distribution<size_t> uniform_dist(1, 3);
+  std::uniform_int_distribution<size_t> uniform_dist(0, 2);
 
   while (!st.stop_requested()) {
-    switch (uniform_dist(e1)) {
-    case 1:
-      fmt::print("Writing small({})\n", b);
-      f.Append({small.data(), small.size()});
-      break;
-    case 2:
-      fmt::print("Writing medium({})\n", b);
-      f.Append({medium.data(), medium.size()});
-      break;
-    case 3:
-      fmt::print("Writing big({})\n", b);
-      f.Append({big.data(), big.size()});
-      break;
-    default:
-      assert(false && "should be unreachable");
-    }
+    auto span = buffers[uniform_dist(e1)];
+    fmt::print("Writing {} bytes of {}\n", span.size(), span[0]);
+    f.Append({span.data(), span.size()});
   }
 }
 
