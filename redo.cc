@@ -59,6 +59,23 @@ void write_all(
   } while (!write_me.empty());
 }
 
+void write_all(io_handle &fd, llfio::file_handle::extent_type offset,
+               io_handle::const_buffer_type buffer) noexcept {
+  io_handle::const_buffers_type write_me{&buffer, 1};
+
+  do {
+    io_handle::io_request<io_handle::const_buffers_type> reqs{write_me, offset};
+    auto written_buffer = llfio::write(fd, reqs).value().front();
+
+    offset += written_buffer.size();
+
+    // shrink partially written buffer
+    buffer = {buffer.data() + written_buffer.size(),
+              buffer.size() - written_buffer.size()};
+
+  } while (buffer.size() != 0);
+}
+
 class CircularFile {
 public:
   CircularFile(const char *file_name, llfio::file_handle::extent_type size)
@@ -72,8 +89,15 @@ public:
     std::array<std::byte, 1024 * 1024> buf;
     buf.fill(std::byte{0});
 
+    auto time = std::chrono::steady_clock::now();
+
     for (size_t i = 0; i < kFileSize; i += buf.size())
-      write_all(fh_, i, {{buf.data(), buf.size()}});
+      write_all(fh_, i, {buf.data(), buf.size()});
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - time);
+
+    fmt::print("Filling {} bytes with zeroes took {}ms\n", size,
+               duration.count());
   }
 
   ~CircularFile() noexcept { llfio::unlink(fh_).value(); }
@@ -83,7 +107,7 @@ public:
 
     if (offset_ + buf.size() > size_) {
       auto partial_size = size_ - offset_;
-      write_all(fh_, offset_, {{buf.data(), partial_size}});
+      write_all(fh_, offset_, {buf.data(), partial_size});
       buf = llfio::io_handle::const_buffer_type(buf.data() + partial_size,
                                                 buf.size() - partial_size);
       offset_ = 0;
