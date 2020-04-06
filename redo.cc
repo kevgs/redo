@@ -88,10 +88,10 @@ void WriteAll(io_handle &fd, llfio::file_handle::extent_type offset,
 
 class ScopedFile {
 public:
-  ScopedFile(const char *file_name, llfio::file_handle::extent_type size)
+  ScopedFile(const char *file_name, llfio::file_handle::extent_type size,
+             llfio::file_handle::caching caching)
       : fh_(llfio::file({}, file_name, llfio::handle::mode::write,
-                        llfio::handle::creation::always_new,
-                        llfio::handle::caching::reads_and_metadata)
+                        llfio::handle::creation::always_new, caching)
                 .value()) {
     llfio::truncate(fh_, size).value();
 
@@ -117,18 +117,19 @@ public:
     ::WriteAll(fh_, offset, buffer);
   }
 
+  void Flush() { fh_.barrier().value(); }
+
 private:
   llfio::file_handle fh_;
 };
 
 class CircularFile {
 public:
-  CircularFile(const char *file_name, llfio::file_handle::extent_type size)
-      : file_(file_name, size), size_(size) {}
+  CircularFile(const char *file_name, llfio::file_handle::extent_type size,
+               llfio::handle::caching caching)
+      : file_(file_name, size, caching), size_(size) {}
 
   void Append(llfio::io_handle::const_buffer_type buf) {
-    std::lock_guard<std::mutex> _(mutex_);
-
     if (offset_ + buf.size() > size_) {
       auto partial_size = size_ - offset_;
       file_.WriteAll(offset_, {buf.data(), partial_size});
@@ -139,24 +140,49 @@ public:
 
     file_.WriteAll(offset_, {buf});
     offset_ = (offset_ + buf.size()) % size_;
-
-    appends_performed_++;
   }
 
-  auto AppendsPerformed() const {
-    std::lock_guard<std::mutex> _(mutex_);
-    return appends_performed_;
-  }
+  void Flush() { file_.Flush(); }
 
 private:
   ScopedFile file_;
   const llfio::file_handle::extent_type size_;
   llfio::io_handle::extent_type offset_{0};
-  mutable std::mutex mutex_;
-  size_t appends_performed_{0};
 };
 
-void ThreadFunction(std::stop_token st, std::byte b, CircularFile &f) {
+class Redo {
+public:
+  virtual ~Redo() {}
+
+  void AppendDurable(tcb::span<std::byte> buffer) {
+    AppendDurableImpl(buffer);
+    appends_handled_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  size_t AppendsHandled() {
+    return appends_handled_.load(std::memory_order_relaxed);
+  }
+
+protected:
+  virtual void AppendDurableImpl(tcb::span<std::byte> buffer) = 0;
+
+private:
+  std::atomic<size_t> appends_handled_{0};
+};
+
+class RedoSimplest final : public Redo {
+private:
+  void AppendDurableImpl(tcb::span<std::byte> buffer) override {
+    std::lock_guard<std::mutex> _(mutex_);
+    file_.Append({buffer.data(), buffer.size()});
+  }
+
+  CircularFile file_{kFileName, kFileSize,
+                     llfio::handle::caching::reads_and_metadata};
+  std::mutex mutex_;
+};
+
+void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
   std::array<std::byte, 2000> buffer;
   buffer.fill(b);
 
@@ -170,7 +196,7 @@ void ThreadFunction(std::stop_token st, std::byte b, CircularFile &f) {
   while (!st.stop_requested()) {
     auto span = buffers[uniform_dist(e1)];
     fmt::print("Writing {} bytes of {}\n", span.size(), span[0]);
-    f.Append({span.data(), span.size()});
+    redo.AppendDurable(span);
   }
 }
 
@@ -179,12 +205,12 @@ int main() {
 
   fmt::print("Hello world\n");
 
-  CircularFile cf(kFileName, kFileSize);
+  RedoSimplest redo;
 
   std::vector<std::jthread> threads;
   for (int i = 0; i < 3; i++) {
     threads.emplace_back(ThreadFunction, static_cast<std::byte>(i + 1),
-                         std::ref(cf));
+                         std::ref(redo));
   }
 
   std::this_thread::sleep_for(30s);
@@ -193,5 +219,5 @@ int main() {
   for (auto &t : threads)
     t.join();
 
-  fmt::print("Appends performed: {}\n", cf.AppendsPerformed());
+  fmt::print("Appends performed: {}\n", redo.AppendsHandled());
 }
