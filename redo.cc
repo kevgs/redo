@@ -19,7 +19,7 @@ using llfio::io_handle;
 static const llfio::file_handle::extent_type kFileSize = 128 * 1024 * 1024;
 static const char kFileName[] = "circular_file";
 
-void write_all(
+void WriteAll(
     io_handle &fd,
     io_handle::io_request<io_handle::const_buffers_type> reqs) noexcept {
   const static size_t kMaxBuffers = 128;
@@ -52,7 +52,7 @@ void write_all(
   } while (!reqs.buffers.empty());
 }
 
-void write_all(
+void WriteAll(
     io_handle &fd, llfio::file_handle::extent_type offset,
     std::initializer_list<io_handle::const_buffer_type> lst) noexcept {
   const static size_t kMaxBuffers = 64;
@@ -66,11 +66,11 @@ void write_all(
       buffer.data(),
       static_cast<size_t>(std::distance(lst.begin(), lst.end()))};
 
-  write_all(fd, {write_me, offset});
+  WriteAll(fd, {write_me, offset});
 }
 
-void write_all(io_handle &fd, llfio::file_handle::extent_type offset,
-               io_handle::const_buffer_type buffer) noexcept {
+void WriteAll(io_handle &fd, llfio::file_handle::extent_type offset,
+              io_handle::const_buffer_type buffer) noexcept {
   io_handle::const_buffers_type write_me{&buffer, 1};
 
   do {
@@ -103,7 +103,7 @@ public:
 
     std::vector<llfio::io_handle::const_buffer_type> v(
         size_ / buf.size(), {buf.data(), buf.size()});
-    write_all(fh_, {v, 0});
+    WriteAll(fh_, {v, 0});
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - time);
@@ -118,7 +118,7 @@ public:
 
     if (offset_ + buf.size() > size_) {
       auto partial_size = size_ - offset_;
-      write_all(fh_, offset_, {buf.data(), partial_size});
+      WriteAll(fh_, offset_, {buf.data(), partial_size});
       buf = llfio::io_handle::const_buffer_type(buf.data() + partial_size,
                                                 buf.size() - partial_size);
       offset_ = 0;
