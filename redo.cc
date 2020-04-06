@@ -144,14 +144,11 @@ private:
 };
 
 void ThreadFunction(std::stop_token st, std::byte b, CircularFile &f) {
-  std::array<std::byte, 20> small;
-  small.fill(b);
-  std::array<std::byte, 200> medium;
-  medium.fill(b);
-  std::array<std::byte, 2000> big;
-  big.fill(b);
+  std::array<std::byte, 2000> buffer;
+  buffer.fill(b);
 
-  std::array<tcb::span<std::byte>, 3> buffers{small, medium, big};
+  std::array<tcb::span<std::byte>, 3> buffers{
+      tcb::span{buffer.data(), 20}, tcb::span{buffer.data(), 200}, buffer};
 
   std::random_device r;
   std::default_random_engine e1(r());
