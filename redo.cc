@@ -1,5 +1,6 @@
 #include <array>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string_view>
@@ -20,7 +21,7 @@ using llfio::io_handle;
 static const llfio::file_handle::extent_type kFileSize = 128 * 1024 * 1024;
 static const char kFileName[] = "circular_file";
 static const size_t kNumberOfThreads = 64;
-static const auto kDuration = std::chrono::seconds(30);
+static const auto kDuration = std::chrono::seconds(20);
 
 void WriteAll(
     io_handle &fd,
@@ -103,7 +104,7 @@ public:
   {
     llfio::truncate(fh_, size).value();
 
-    std::array<std::byte, 1024 * 1024> buf;
+    alignas(4096) std::array<std::byte, 1024 * 1024> buf;
     buf.fill(std::byte{0});
 
     auto time = std::chrono::steady_clock::now();
@@ -239,6 +240,33 @@ private:
   CircularFile file_{kFileName, kFileSize, llfio::handle::caching::all};
 };
 
+class RedoODirectSparse final : public Redo {
+public:
+  RedoODirectSparse() { zeroes_.fill(std::byte{0}); }
+
+  std::string_view Name() final { return "RedoODirectSparse"; };
+
+private:
+  static const size_t kBufferSize = 10 * 1024 * 1024;
+  static const size_t kAlignment = 4096;
+
+  void AppendDurableImpl(tcb::span<std::byte> buffer) final {
+    std::lock_guard<std::mutex> _(mutex_);
+    std::copy(buffer.begin(), buffer.end(), &buffer_[0]);
+    auto tail_size = kAlignment - buffer.size() % zeroes_.size();
+    std::copy(zeroes_.begin(), zeroes_.begin() + tail_size,
+              &buffer_[buffer.size()]);
+    file_.Append({&buffer_[0], buffer.size() + tail_size});
+  }
+
+  std::mutex mutex_;
+  std::unique_ptr<std::byte[], decltype(&std::free)> buffer_{
+      static_cast<std::byte *>(std::aligned_alloc(kBufferSize, kAlignment)),
+      std::free};
+  std::array<std::byte, kAlignment> zeroes_;
+  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::none};
+};
+
 void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
   std::array<std::byte, 2000> buffer;
   buffer.fill(b);
@@ -279,6 +307,7 @@ template <class REDO> void Test() {
 }
 
 int main() {
+  Test<RedoODirectSparse>();
   Test<RedoSimplest>();
   Test<RedoGroupFlush>();
 }
