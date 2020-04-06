@@ -86,15 +86,14 @@ void WriteAll(io_handle &fd, llfio::file_handle::extent_type offset,
   } while (buffer.size() != 0);
 }
 
-class CircularFile {
+class ScopedFile {
 public:
-  CircularFile(const char *file_name, llfio::file_handle::extent_type size)
+  ScopedFile(const char *file_name, llfio::file_handle::extent_type size)
       : fh_(llfio::file({}, file_name, llfio::handle::mode::write,
                         llfio::handle::creation::always_new,
                         llfio::handle::caching::reads_and_metadata)
-                .value()),
-        size_(size) {
-    llfio::truncate(fh_, size_).value();
+                .value()) {
+    llfio::truncate(fh_, size).value();
 
     std::array<std::byte, 1024 * 1024> buf;
     buf.fill(std::byte{0});
@@ -102,8 +101,8 @@ public:
     auto time = std::chrono::steady_clock::now();
 
     std::vector<llfio::io_handle::const_buffer_type> v(
-        size_ / buf.size(), {buf.data(), buf.size()});
-    WriteAll(fh_, {v, 0});
+        size / buf.size(), {buf.data(), buf.size()});
+    ::WriteAll(fh_, {v, 0});
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - time);
@@ -111,20 +110,34 @@ public:
                duration.count());
   }
 
-  ~CircularFile() noexcept { llfio::unlink(fh_).value(); }
+  ~ScopedFile() { llfio::unlink(fh_).value(); }
+
+  void WriteAll(llfio::file_handle::extent_type offset,
+                io_handle::const_buffer_type buffer) {
+    ::WriteAll(fh_, offset, buffer);
+  }
+
+private:
+  llfio::file_handle fh_;
+};
+
+class CircularFile {
+public:
+  CircularFile(const char *file_name, llfio::file_handle::extent_type size)
+      : file_(file_name, size), size_(size) {}
 
   void Append(llfio::io_handle::const_buffer_type buf) {
     std::lock_guard<std::mutex> _(mutex_);
 
     if (offset_ + buf.size() > size_) {
       auto partial_size = size_ - offset_;
-      WriteAll(fh_, offset_, {buf.data(), partial_size});
+      file_.WriteAll(offset_, {buf.data(), partial_size});
       buf = llfio::io_handle::const_buffer_type(buf.data() + partial_size,
                                                 buf.size() - partial_size);
       offset_ = 0;
     }
 
-    write(fh_, offset_, {buf});
+    file_.WriteAll(offset_, {buf});
     offset_ = (offset_ + buf.size()) % size_;
 
     appends_performed_++;
@@ -136,7 +149,7 @@ public:
   }
 
 private:
-  llfio::file_handle fh_;
+  ScopedFile file_;
   const llfio::file_handle::extent_type size_;
   llfio::io_handle::extent_type offset_{0};
   mutable std::mutex mutex_;
