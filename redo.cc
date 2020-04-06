@@ -20,6 +20,39 @@ static const llfio::file_handle::extent_type kFileSize = 128 * 1024 * 1024;
 static const char kFileName[] = "circular_file";
 
 void write_all(
+    io_handle &fd,
+    io_handle::io_request<io_handle::const_buffers_type> reqs) noexcept {
+  const static size_t kMaxBuffers = 128;
+
+  assert(reqs.buffers.size() <= kMaxBuffers);
+
+  do {
+    auto written_buffers = llfio::write(fd, reqs).value();
+
+    reqs.offset += std::accumulate(
+        written_buffers.begin(), written_buffers.end(), static_cast<size_t>(0),
+        [](auto a, auto b) { return a + b.size(); });
+
+    auto [_, it] = std::mismatch(
+        reqs.buffers.begin(), reqs.buffers.end(), written_buffers.begin(),
+        [](auto a, auto b) { return a.size() == b.size(); });
+
+    // forget fully written buffers
+    reqs.buffers =
+        reqs.buffers.subspan(std::distance(written_buffers.begin(), it));
+
+    // shrink partially written buffer
+    if (it != written_buffers.end()) {
+      assert(std::next(it) == written_buffers.end());
+
+      reqs.buffers.front() = {reqs.buffers.front().data() + it->size(),
+                              reqs.buffers.front().size() - it->size()};
+    }
+
+  } while (!reqs.buffers.empty());
+}
+
+void write_all(
     io_handle &fd, llfio::file_handle::extent_type offset,
     std::initializer_list<io_handle::const_buffer_type> lst) noexcept {
   const static size_t kMaxBuffers = 64;
@@ -33,30 +66,7 @@ void write_all(
       buffer.data(),
       static_cast<size_t>(std::distance(lst.begin(), lst.end()))};
 
-  do {
-    io_handle::io_request<io_handle::const_buffers_type> reqs{write_me, offset};
-    auto written_buffers = llfio::write(fd, reqs).value();
-
-    offset += std::accumulate(written_buffers.begin(), written_buffers.end(),
-                              static_cast<size_t>(0),
-                              [](auto a, auto b) { return a + b.size(); });
-
-    auto [_, it] =
-        std::mismatch(write_me.begin(), write_me.end(), written_buffers.begin(),
-                      [](auto a, auto b) { return a.size() == b.size(); });
-
-    // forget fully written buffers
-    write_me = write_me.subspan(std::distance(written_buffers.begin(), it));
-
-    // shrink partially written buffer
-    if (it != written_buffers.end()) {
-      assert(std::next(it) == written_buffers.end());
-
-      write_me.front() = {write_me.front().data() + it->size(),
-                          write_me.front().size() - it->size()};
-    }
-
-  } while (!write_me.empty());
+  write_all(fd, {write_me, offset});
 }
 
 void write_all(io_handle &fd, llfio::file_handle::extent_type offset,
@@ -91,11 +101,12 @@ public:
 
     auto time = std::chrono::steady_clock::now();
 
-    for (size_t i = 0; i < size_; i += buf.size())
-      write_all(fh_, i, {buf.data(), buf.size()});
+    std::vector<llfio::io_handle::const_buffer_type> v(
+        size_ / buf.size(), {buf.data(), buf.size()});
+    write_all(fh_, {v, 0});
+
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - time);
-
     fmt::print("Filling {} bytes with zeroes took {}ms\n", size,
                duration.count());
   }
