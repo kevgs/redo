@@ -2,6 +2,7 @@
 #include <chrono>
 #include <mutex>
 #include <random>
+#include <string_view>
 #include <vector>
 
 #include <cassert>
@@ -18,6 +19,8 @@ using llfio::io_handle;
 
 static const llfio::file_handle::extent_type kFileSize = 128 * 1024 * 1024;
 static const char kFileName[] = "circular_file";
+static const size_t kNumberOfThreads = 64;
+static const auto kDuration = std::chrono::seconds(30);
 
 void WriteAll(
     io_handle &fd,
@@ -92,7 +95,12 @@ public:
              llfio::file_handle::caching caching)
       : fh_(llfio::file({}, file_name, llfio::handle::mode::write,
                         llfio::handle::creation::always_new, caching)
-                .value()) {
+                .value())
+#ifndef __linux__
+        ,
+        size_(size)
+#endif
+  {
     llfio::truncate(fh_, size).value();
 
     std::array<std::byte, 1024 * 1024> buf;
@@ -117,10 +125,23 @@ public:
     ::WriteAll(fh_, offset, buffer);
   }
 
-  void Flush() { fh_.barrier().value(); }
+  void Flush() {
+#ifdef __linux__
+    fdatasync(fh_.native_handle().fd);
+#else
+    std::array<std::byte, 1> buf;
+    io_handle::const_buffer_type buf2(buf.data(), size_);
+    fh_.barrier(io_handle::io_request<io_handle::const_buffers_type>(
+                    io_handle::const_buffers_type(&buf2, 1), 0),
+                io_handle::barrier_kind::wait_data_only);
+#endif
+  }
 
 private:
   llfio::file_handle fh_;
+#ifndef __linux__
+  llfio::file_handle::extent_type size_;
+#endif
 };
 
 class CircularFile {
@@ -154,6 +175,8 @@ class Redo {
 public:
   virtual ~Redo() {}
 
+  virtual std::string_view Name() = 0;
+
   void AppendDurable(tcb::span<std::byte> buffer) {
     AppendDurableImpl(buffer);
     appends_handled_.fetch_add(1, std::memory_order_relaxed);
@@ -171,6 +194,9 @@ private:
 };
 
 class RedoSimplest final : public Redo {
+public:
+  std::string_view Name() final { return "RedoSimplest"; };
+
 private:
   void AppendDurableImpl(tcb::span<std::byte> buffer) override {
     std::lock_guard<std::mutex> _(mutex_);
@@ -180,6 +206,37 @@ private:
   CircularFile file_{kFileName, kFileSize,
                      llfio::handle::caching::reads_and_metadata};
   std::mutex mutex_;
+};
+
+class RedoGroupFlush final : public Redo {
+public:
+  std::string_view Name() final { return "RedoGroupFlush"; };
+
+private:
+  void AppendDurableImpl(tcb::span<std::byte> buffer) final {
+    size_t my_lsn;
+    {
+      std::lock_guard<std::mutex> _(append_mutex_);
+      file_.Append({buffer.data(), buffer.size()});
+      my_lsn = ++lsn_;
+    }
+
+    {
+      std::lock_guard<std::mutex> _(flush_mutex_);
+      if (my_lsn < flushed_lsn_)
+        return;
+      file_.Flush();
+      flushed_lsn_ = my_lsn;
+    }
+  }
+
+  std::mutex append_mutex_;
+  size_t lsn_{0};
+
+  std::mutex flush_mutex_;
+  size_t flushed_lsn_{0};
+
+  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::all};
 };
 
 void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
@@ -195,29 +252,33 @@ void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
 
   while (!st.stop_requested()) {
     auto span = buffers[uniform_dist(e1)];
-    fmt::print("Writing {} bytes of {}\n", span.size(), span[0]);
+    // fmt::print("Writing {} bytes of {}\n", span.size(), span[0]);
     redo.AppendDurable(span);
   }
 }
 
-int main() {
+template <class REDO> void Test() {
   using namespace std::chrono_literals;
 
-  fmt::print("Hello world\n");
-
-  RedoSimplest redo;
+  REDO redo;
 
   std::vector<std::jthread> threads;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < kNumberOfThreads; i++) {
     threads.emplace_back(ThreadFunction, static_cast<std::byte>(i + 1),
                          std::ref(redo));
   }
 
-  std::this_thread::sleep_for(30s);
+  std::this_thread::sleep_for(kDuration);
   for (auto &t : threads)
     t.request_stop();
   for (auto &t : threads)
     t.join();
 
-  fmt::print("Appends performed: {}\n", redo.AppendsHandled());
+  fmt::print("{} handled {} appends for {}s\n", redo.Name(),
+             redo.AppendsHandled(), kDuration.count());
+}
+
+int main() {
+  Test<RedoSimplest>();
+  Test<RedoGroupFlush>();
 }
