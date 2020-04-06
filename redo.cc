@@ -128,7 +128,7 @@ public:
 
   void Flush() {
 #ifdef __linux__
-    fdatasync(fh_.native_handle().fd);
+    fsync(fh_.native_handle().fd);
 #else
     std::array<std::byte, 1> buf;
     io_handle::const_buffer_type buf2(buf.data(), size_);
@@ -204,8 +204,7 @@ private:
     file_.Append({buffer.data(), buffer.size()});
   }
 
-  CircularFile file_{kFileName, kFileSize,
-                     llfio::handle::caching::reads_and_metadata};
+  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::reads};
   std::mutex mutex_;
 };
 
