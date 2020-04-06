@@ -107,16 +107,9 @@ public:
     alignas(4096) std::array<std::byte, 1024 * 1024> buf;
     buf.fill(std::byte{0});
 
-    auto time = std::chrono::steady_clock::now();
-
     std::vector<llfio::io_handle::const_buffer_type> v(
         size / buf.size(), {buf.data(), buf.size()});
     ::WriteAll(fh_, {v, 0});
-
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - time);
-    fmt::print("Filling {} bytes with zeroes took {}ms\n", size,
-               duration.count());
   }
 
   ~ScopedFile() { llfio::unlink(fh_).value(); }
@@ -205,6 +198,23 @@ private:
   }
 
   CircularFile file_{kFileName, kFileSize, llfio::handle::caching::reads};
+  std::mutex mutex_;
+};
+
+class RedoSimplestOverlappedFsync final : public Redo {
+public:
+  std::string_view Name() final { return "RedoSimplestOverlappedFsync"; };
+
+private:
+  void AppendDurableImpl(tcb::span<std::byte> buffer) override {
+    {
+      std::lock_guard<std::mutex> _(mutex_);
+      file_.Append({buffer.data(), buffer.size()});
+    }
+    file_.Flush();
+  }
+
+  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::all};
   std::mutex mutex_;
 };
 
@@ -306,7 +316,8 @@ template <class REDO> void Test() {
 }
 
 int main() {
-  Test<RedoODirectSparse>();
   Test<RedoSimplest>();
+  Test<RedoSimplestOverlappedFsync>();
   Test<RedoGroupFlush>();
+  Test<RedoODirectSparse>();
 }
