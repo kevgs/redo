@@ -84,14 +84,14 @@ public:
                         llfio::handle::caching::reads_and_metadata)
                 .value()),
         size_(size) {
-    llfio::truncate(fh_, kFileSize).value();
+    llfio::truncate(fh_, size_).value();
 
     std::array<std::byte, 1024 * 1024> buf;
     buf.fill(std::byte{0});
 
     auto time = std::chrono::steady_clock::now();
 
-    for (size_t i = 0; i < kFileSize; i += buf.size())
+    for (size_t i = 0; i < size_; i += buf.size())
       write_all(fh_, i, {buf.data(), buf.size()});
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - time);
