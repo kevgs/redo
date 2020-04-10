@@ -4,6 +4,7 @@
 #include <mutex>
 #include <random>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <cassert>
@@ -177,6 +178,21 @@ public:
     assert(capacity % alignment == 0);
   }
 
+  AlignedBuffer(const AlignedBuffer &) = delete;
+  AlignedBuffer &operator=(const AlignedBuffer &) = delete;
+
+  AlignedBuffer(AlignedBuffer &&rhs)
+      : alignment_(rhs.alignment_), capacity_(rhs.capacity_),
+        buffer_{std::move(rhs.buffer_)}, size_{rhs.size_} {}
+
+  AlignedBuffer &operator=(AlignedBuffer &&rhs) {
+    alignment_ = rhs.alignment_;
+    capacity_ = rhs.capacity_;
+    buffer_ = std::move(rhs.buffer_);
+    size_ = rhs.size_;
+    return *this;
+  }
+
   void Append(tcb::span<const std::byte> buf) {
     assert(Size() + buf.size() < capacity_);
     std::copy(buf.begin(), buf.end(), &buffer_[size_]);
@@ -190,8 +206,8 @@ public:
   size_t Capacity() const { return capacity_; }
 
 private:
-  const size_t alignment_;
-  const size_t capacity_;
+  size_t alignment_;
+  size_t capacity_;
   std::unique_ptr<std::byte[], decltype(&std::free)> buffer_;
   size_t size_{0};
 };
@@ -392,6 +408,73 @@ private:
   CircularFile file_{kFileName, kFileSize, llfio::handle::caching::none};
 };
 
+class RedoODirectTwoBuffers final : public Redo {
+public:
+  RedoODirectTwoBuffers() { zeroes_.fill(std::byte{0}); }
+
+  std::string_view Name() final { return "RedoODirectTwoBuffers"; };
+
+  size_t Append(tcb::span<std::byte> buffer) final {
+    std::unique_lock<std::mutex> flush_lock(flush_mutex_);
+    std::lock_guard<std::mutex> _(append_mutex_);
+
+    if (buffer_.Size() + buffer.size() > buffer_.Capacity()) {
+      AppendBufferToFile(buffer_);
+      committed_lsn_.store(lsn_);
+    }
+    flush_lock.unlock();
+
+    buffer_.Append(buffer);
+
+    return ++lsn_;
+  }
+
+  void Commit(size_t lsn) final {
+    if (lsn <= committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
+    std::lock_guard<std::mutex> _(flush_mutex_);
+
+    if (lsn <= committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
+    size_t flushing_up_to;
+    {
+      std::lock_guard<std::mutex> _(append_mutex_);
+      std::swap(buffer_, other_buffer_);
+      flushing_up_to = lsn_;
+    }
+
+    AppendBufferToFile(other_buffer_);
+    committed_lsn_.store(flushing_up_to, std::memory_order_relaxed);
+  }
+
+  size_t CommitsHandled() const final {
+    return committed_lsn_.load(std::memory_order_relaxed);
+  }
+
+private:
+  static const size_t kBufferSize = 10 * 1024 * 1024;
+  static const size_t kAlignment = 4096;
+
+  void AppendBufferToFile(AlignedBuffer &buffer) {
+    size_t tail_size = kAlignment - buffer.Size() % kAlignment;
+    buffer.Append({zeroes_.data(), tail_size});
+    file_.Append({buffer.Data(), buffer.Size()});
+    buffer.Clear();
+  }
+
+  std::mutex append_mutex_;
+  size_t lsn_{0};
+  AlignedBuffer buffer_{kBufferSize, kAlignment};
+  AlignedBuffer other_buffer_{kBufferSize, kAlignment};
+
+  std::mutex flush_mutex_;
+  std::atomic<size_t> committed_lsn_{0};
+  std::array<std::byte, kAlignment> zeroes_;
+  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::none};
+};
+
 void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
   std::array<std::byte, 2000> buffer;
   buffer.fill(b);
@@ -445,6 +528,7 @@ int main() {
   Test<RedoSync>();
   Test<RedoODirectSparse>();
   Test<RedoODirectBuffer>();
+  Test<RedoODirectTwoBuffers>();
   Test<RedoOverlappedFsync>();
   Test<RedoGroupCommit>();
 }
