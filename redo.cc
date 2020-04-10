@@ -167,6 +167,34 @@ private:
   llfio::io_handle::extent_type offset_{0};
 };
 
+class AlignedBuffer {
+public:
+  AlignedBuffer(size_t capacity, size_t alignment)
+      : capacity_{capacity}, alignment_{alignment},
+        buffer_{
+            static_cast<std::byte *>(std::aligned_alloc(capacity, alignment)),
+            std::free} {
+    assert(capacity % alignment == 0);
+  }
+
+  void Append(tcb::span<const std::byte> buf) {
+    assert(Size() + buf.size() < capacity_);
+    std::copy(buf.begin(), buf.end(), &buffer_[size_]);
+    size_ += buf.size();
+  }
+
+  void Clear() { size_ = 0; }
+
+  const std::byte *Data() const { return &buffer_[0]; }
+  size_t Size() const { return size_; }
+
+private:
+  const size_t alignment_;
+  const size_t capacity_;
+  std::unique_ptr<std::byte[], decltype(&std::free)> buffer_;
+  size_t size_{0};
+};
+
 class Redo {
 public:
   virtual ~Redo() {}
@@ -281,11 +309,13 @@ public:
 
   size_t Append(tcb::span<std::byte> buffer) final {
     std::lock_guard<std::mutex> _(mutex_);
-    std::copy(buffer.begin(), buffer.end(), &buffer_[0]);
+
+    buffer_.Append(buffer);
     auto tail_size = kAlignment - buffer.size() % zeroes_.size();
-    std::copy(zeroes_.begin(), zeroes_.begin() + tail_size,
-              &buffer_[buffer.size()]);
-    file_.Append({&buffer_[0], buffer.size() + tail_size});
+    buffer_.Append({zeroes_.data(), tail_size});
+    file_.Append({buffer_.Data(), buffer_.Size()});
+    buffer_.Clear();
+
     return ++committed_lsn_;
   }
 
@@ -296,14 +326,12 @@ public:
   }
 
 private:
-  static const size_t kBufferSize = 10 * 1024 * 1024;
+  static const size_t kBufferSize = 1 * 1024 * 1024;
   static const size_t kAlignment = 4096;
 
   std::mutex mutex_;
   std::atomic<size_t> committed_lsn_{0};
-  std::unique_ptr<std::byte[], decltype(&std::free)> buffer_{
-      static_cast<std::byte *>(std::aligned_alloc(kBufferSize, kAlignment)),
-      std::free};
+  AlignedBuffer buffer_{kBufferSize, kAlignment};
   std::array<std::byte, kAlignment> zeroes_;
   CircularFile file_{kFileName, kFileSize, llfio::handle::caching::none};
 };
