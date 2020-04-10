@@ -309,6 +309,9 @@ public:
   }
 
   void Commit(size_t lsn) final {
+    if (lsn <= committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
     file_.Flush();
 
     for (;;) {
