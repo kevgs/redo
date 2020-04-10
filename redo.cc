@@ -180,9 +180,9 @@ public:
   virtual size_t CommitsHandled() const = 0;
 };
 
-class RedoSimplest final : public Redo {
+class RedoSync final : public Redo {
 public:
-  std::string_view Name() final { return "RedoSimplest"; };
+  std::string_view Name() final { return "RedoSync"; };
 
   size_t Append(tcb::span<std::byte> buffer) final {
     std::lock_guard<std::mutex> _(mutex_);
@@ -202,9 +202,9 @@ private:
   std::mutex mutex_;
 };
 
-class RedoSimplestOverlappedFsync final : public Redo {
+class RedoOverlappedFsync final : public Redo {
 public:
-  std::string_view Name() final { return "RedoSimplestOverlappedFsync"; };
+  std::string_view Name() final { return "RedoOverlappedFsync"; };
 
   size_t Append(tcb::span<std::byte> buffer) final {
     std::lock_guard<std::mutex> _(mutex_);
@@ -358,8 +358,8 @@ template <class REDO> void Test() {
 } // namespace
 
 int main() {
-  Test<RedoSimplest>();
-  Test<RedoSimplestOverlappedFsync>();
+  Test<RedoSync>();
+  Test<RedoOverlappedFsync>();
   Test<RedoGroupCommit>();
   Test<RedoODirectSparse>();
 }
