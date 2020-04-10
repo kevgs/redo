@@ -15,6 +15,8 @@
 #include "redo/span.hpp"
 #include "redo/stop_token.hpp"
 
+namespace {
+
 namespace llfio = LLFIO_V2_NAMESPACE;
 using llfio::io_handle;
 
@@ -171,33 +173,32 @@ public:
 
   virtual std::string_view Name() = 0;
 
-  void AppendDurable(tcb::span<std::byte> buffer) {
-    AppendDurableImpl(buffer);
-    appends_handled_.fetch_add(1, std::memory_order_relaxed);
-  }
+  virtual size_t Append(tcb::span<std::byte> buffer) = 0;
 
-  size_t AppendsHandled() {
-    return appends_handled_.load(std::memory_order_relaxed);
-  }
+  virtual void Commit(size_t lsn) = 0;
 
-protected:
-  virtual void AppendDurableImpl(tcb::span<std::byte> buffer) = 0;
-
-private:
-  std::atomic<size_t> appends_handled_{0};
+  virtual size_t CommitsHandled() const = 0;
 };
 
 class RedoSimplest final : public Redo {
 public:
   std::string_view Name() final { return "RedoSimplest"; };
 
-private:
-  void AppendDurableImpl(tcb::span<std::byte> buffer) override {
+  size_t Append(tcb::span<std::byte> buffer) final {
     std::lock_guard<std::mutex> _(mutex_);
     file_.Append({buffer.data(), buffer.size()});
+    return committed_lsn_.fetch_add(1, std::memory_order_relaxed) + 1;
   }
 
+  void Commit(size_t) final {}
+
+  size_t CommitsHandled() const final {
+    return committed_lsn_.load(std::memory_order_relaxed);
+  }
+
+private:
   CircularFile file_{kFileName, kFileSize, llfio::handle::caching::reads};
+  std::atomic<size_t> committed_lsn_{0};
   std::mutex mutex_;
 };
 
@@ -205,46 +206,69 @@ class RedoSimplestOverlappedFsync final : public Redo {
 public:
   std::string_view Name() final { return "RedoSimplestOverlappedFsync"; };
 
-private:
-  void AppendDurableImpl(tcb::span<std::byte> buffer) override {
-    {
-      std::lock_guard<std::mutex> _(mutex_);
-      file_.Append({buffer.data(), buffer.size()});
-    }
-    file_.Flush();
+  size_t Append(tcb::span<std::byte> buffer) final {
+    std::lock_guard<std::mutex> _(mutex_);
+    file_.Append({buffer.data(), buffer.size()});
+    return ++lsn_;
   }
 
+  void Commit(size_t lsn) final {
+    file_.Flush();
+
+    for (;;) {
+      auto stored_lsn = committed_lsn_.load(std::memory_order_relaxed);
+
+      if (lsn <= stored_lsn)
+        break;
+
+      committed_lsn_.compare_exchange_weak(stored_lsn, lsn);
+    }
+  }
+
+  size_t CommitsHandled() const final {
+    return committed_lsn_.load(std::memory_order_relaxed);
+  }
+
+private:
   CircularFile file_{kFileName, kFileSize, llfio::handle::caching::all};
+  size_t lsn_{0};
+  std::atomic<size_t> committed_lsn_{0};
   std::mutex mutex_;
 };
 
-class RedoGroupFlush final : public Redo {
+class RedoGroupCommit final : public Redo {
 public:
-  std::string_view Name() final { return "RedoGroupFlush"; };
+  std::string_view Name() final { return "RedoGroupCommit"; };
 
-private:
-  void AppendDurableImpl(tcb::span<std::byte> buffer) final {
-    size_t my_lsn;
-    {
-      std::lock_guard<std::mutex> _(append_mutex_);
-      file_.Append({buffer.data(), buffer.size()});
-      my_lsn = ++lsn_;
-    }
-
-    {
-      std::lock_guard<std::mutex> _(flush_mutex_);
-      if (my_lsn < flushed_lsn_)
-        return;
-      file_.Flush();
-      flushed_lsn_ = my_lsn;
-    }
+  size_t Append(tcb::span<std::byte> buffer) final {
+    std::lock_guard<std::mutex> _(append_mutex_);
+    file_.Append({buffer.data(), buffer.size()});
+    return ++lsn_;
   }
 
+  void Commit(size_t lsn) final {
+    if (lsn < committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
+    std::lock_guard<std::mutex> _(flush_mutex_);
+
+    if (lsn < committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
+    file_.Flush();
+    committed_lsn_.store(lsn, std::memory_order_relaxed);
+  }
+
+  size_t CommitsHandled() const final {
+    return committed_lsn_.load(std::memory_order_relaxed);
+  }
+
+private:
   std::mutex append_mutex_;
   size_t lsn_{0};
 
   std::mutex flush_mutex_;
-  size_t flushed_lsn_{0};
+  std::atomic<size_t> committed_lsn_{0};
 
   CircularFile file_{kFileName, kFileSize, llfio::handle::caching::all};
 };
@@ -255,20 +279,28 @@ public:
 
   std::string_view Name() final { return "RedoODirectSparse"; };
 
-private:
-  static const size_t kBufferSize = 10 * 1024 * 1024;
-  static const size_t kAlignment = 4096;
-
-  void AppendDurableImpl(tcb::span<std::byte> buffer) final {
+  size_t Append(tcb::span<std::byte> buffer) final {
     std::lock_guard<std::mutex> _(mutex_);
     std::copy(buffer.begin(), buffer.end(), &buffer_[0]);
     auto tail_size = kAlignment - buffer.size() % zeroes_.size();
     std::copy(zeroes_.begin(), zeroes_.begin() + tail_size,
               &buffer_[buffer.size()]);
     file_.Append({&buffer_[0], buffer.size() + tail_size});
+    return ++committed_lsn_;
   }
 
+  void Commit(size_t lsn) final {}
+
+  size_t CommitsHandled() const final {
+    return committed_lsn_.load(std::memory_order_relaxed);
+  }
+
+private:
+  static const size_t kBufferSize = 10 * 1024 * 1024;
+  static const size_t kAlignment = 4096;
+
   std::mutex mutex_;
+  std::atomic<size_t> committed_lsn_{0};
   std::unique_ptr<std::byte[], decltype(&std::free)> buffer_{
       static_cast<std::byte *>(std::aligned_alloc(kBufferSize, kAlignment)),
       std::free};
@@ -287,10 +319,18 @@ void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
   std::default_random_engine e1(r());
   std::uniform_int_distribution<size_t> uniform_dist(0, 2);
 
+  // One iteration is one use transaction.
   while (!st.stop_requested()) {
-    auto span = buffers[uniform_dist(e1)];
-    // fmt::print("Writing {} bytes of {}\n", span.size(), span[0]);
-    redo.AppendDurable(span);
+    size_t how_much_appends = uniform_dist(e1);
+
+    // User transaction consists of several MTR.
+    size_t lsn = 0;
+    for (size_t i = 0; i < how_much_appends; ++i) {
+      auto span = buffers[uniform_dist(e1)];
+      lsn = redo.Append(span);
+    }
+
+    redo.Commit(lsn);
   }
 }
 
@@ -311,13 +351,15 @@ template <class REDO> void Test() {
   for (auto &t : threads)
     t.join();
 
-  fmt::print("{} handled {} appends for {}s\n", redo.Name(),
-             redo.AppendsHandled(), kDuration.count());
+  fmt::print("{} handled {} commits for {}s\n", redo.Name(),
+             redo.CommitsHandled(), kDuration.count());
 }
+
+} // namespace
 
 int main() {
   Test<RedoSimplest>();
   Test<RedoSimplestOverlappedFsync>();
-  Test<RedoGroupFlush>();
+  Test<RedoGroupCommit>();
   Test<RedoODirectSparse>();
 }
