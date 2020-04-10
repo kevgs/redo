@@ -247,6 +247,57 @@ private:
   std::mutex mutex_;
 };
 
+class RedoSyncBuffer final : public Redo {
+public:
+
+  std::string_view Name() final { return "RedoSyncBuffer"; };
+
+  size_t Append(tcb::span<std::byte> buffer) final {
+    std::lock_guard<std::mutex> _(mutex_);
+
+    if (buffer_.Size() + buffer.size() > buffer_.Capacity()) {
+      AppendBufferToFile();
+      committed_lsn_.store(lsn_);
+    }
+
+    buffer_.Append(buffer);
+
+    return ++lsn_;
+  }
+
+  void Commit(size_t lsn) final {
+    if (lsn <= committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
+    std::lock_guard<std::mutex> _(mutex_);
+
+    if (lsn <= committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
+    AppendBufferToFile();
+    committed_lsn_.store(lsn_);
+  }
+
+  size_t CommitsHandled() const final {
+    return committed_lsn_.load(std::memory_order_relaxed);
+  }
+
+private:
+  static const size_t kBufferSize = 10 * 1024 * 1024;
+  static const size_t kAlignment = 4096;
+
+  void AppendBufferToFile() {
+    file_.Append({buffer_.Data(), buffer_.Size()});
+    buffer_.Clear();
+  }
+
+  std::mutex mutex_;
+  std::atomic<size_t> lsn_{0};
+  std::atomic<size_t> committed_lsn_{0};
+  AlignedBuffer buffer_{kBufferSize, kAlignment};
+  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::reads};
+};
+
 class RedoOverlappedFsync final : public Redo {
 public:
   std::string_view Name() final { return "RedoOverlappedFsync"; };
@@ -526,6 +577,7 @@ template <class REDO> void Test() {
 
 int main() {
   Test<RedoSync>();
+  Test<RedoSyncBuffer>();
   Test<RedoODirectSparse>();
   Test<RedoODirectBuffer>();
   Test<RedoODirectTwoBuffers>();
