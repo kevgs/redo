@@ -187,6 +187,7 @@ public:
 
   const std::byte *Data() const { return &buffer_[0]; }
   size_t Size() const { return size_; }
+  size_t Capacity() const { return capacity_; }
 
 private:
   const size_t alignment_;
@@ -336,6 +337,61 @@ private:
   CircularFile file_{kFileName, kFileSize, llfio::handle::caching::none};
 };
 
+class RedoODirectBuffer final : public Redo {
+public:
+  RedoODirectBuffer() { zeroes_.fill(std::byte{0}); }
+
+  std::string_view Name() final { return "RedoODirectBuffer"; };
+
+  size_t Append(tcb::span<std::byte> buffer) final {
+    std::lock_guard<std::mutex> _(mutex_);
+
+    if (buffer_.Size() + buffer.size() > buffer_.Capacity()) {
+      AppendBufferToFile();
+      committed_lsn_.store(lsn_);
+    }
+
+    buffer_.Append(buffer);
+
+    return ++lsn_;
+  }
+
+  void Commit(size_t lsn) final {
+    if (lsn <= committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
+    std::lock_guard<std::mutex> _(mutex_);
+
+    if (lsn <= committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
+    AppendBufferToFile();
+    committed_lsn_.store(lsn_);
+  }
+
+  size_t CommitsHandled() const final {
+    return committed_lsn_.load(std::memory_order_relaxed);
+  }
+
+private:
+  static const size_t kBufferSize = 10 * 1024 * 1024;
+  static const size_t kAlignment = 4096;
+
+  void AppendBufferToFile() {
+    size_t tail_size = kAlignment - buffer_.Size() % kAlignment;
+    buffer_.Append({zeroes_.data(), tail_size});
+    file_.Append({buffer_.Data(), buffer_.Size()});
+    buffer_.Clear();
+  }
+
+  std::mutex mutex_;
+  std::atomic<size_t> lsn_{0};
+  std::atomic<size_t> committed_lsn_{0};
+  AlignedBuffer buffer_{kBufferSize, kAlignment};
+  std::array<std::byte, kAlignment> zeroes_;
+  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::none};
+};
+
 void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
   std::array<std::byte, 2000> buffer;
   buffer.fill(b);
@@ -387,7 +443,8 @@ template <class REDO> void Test() {
 
 int main() {
   Test<RedoSync>();
+  Test<RedoODirectSparse>();
+  Test<RedoODirectBuffer>();
   Test<RedoOverlappedFsync>();
   Test<RedoGroupCommit>();
-  Test<RedoODirectSparse>();
 }
