@@ -9,6 +9,7 @@
 
 #include <cassert>
 
+#include <fmt/color.h>
 #include <fmt/format.h>
 #include <llfio.hpp>
 
@@ -23,7 +24,7 @@ using llfio::io_handle;
 
 static const llfio::file_handle::extent_type kFileSize = 128 * 1024 * 1024;
 static const char kFileName[] = "circular_file";
-static const size_t kNumberOfThreads = 64;
+static const size_t kThreads = 64;
 static const auto kDuration = std::chrono::seconds(20);
 
 void WriteAll(
@@ -249,7 +250,6 @@ private:
 
 class RedoSyncBuffer final : public Redo {
 public:
-
   std::string_view Name() final { return "RedoSyncBuffer"; };
 
   size_t Append(tcb::span<std::byte> buffer) final {
@@ -558,7 +558,7 @@ template <class REDO> void Test() {
   REDO redo;
 
   std::vector<std::jthread> threads;
-  for (int i = 0; i < kNumberOfThreads; i++) {
+  for (int i = 0; i < kThreads; i++) {
     threads.emplace_back(ThreadFunction, static_cast<std::byte>(i + 1),
                          std::ref(redo));
   }
@@ -569,13 +569,18 @@ template <class REDO> void Test() {
   for (auto &t : threads)
     t.join();
 
-  fmt::print("{} handled {} commits for {}s\n", redo.Name(),
-             redo.CommitsHandled(), kDuration.count());
+  fmt::print("{} handled", redo.Name());
+  fmt::print(fg(fmt::color::white), " {} ", redo.CommitsHandled());
+  fmt::print("commits\n", redo.CommitsHandled());
 }
 
 } // namespace
 
 int main() {
+  fmt::print("File size: {}, threads: {}, duration: {}s\n", kFileSize, kThreads,
+             kDuration.count());
+  fmt::print("\n");
+
   Test<RedoSync>();
   Test<RedoSyncBuffer>();
   Test<RedoODirectSparse>();
