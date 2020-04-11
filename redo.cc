@@ -125,7 +125,9 @@ public:
 
   void Flush() {
 #ifdef __linux__
-    fsync(fh_.native_handle().fd);
+    int ret = fsync(fh_.native_handle().fd);
+    (void)ret;
+    assert(ret == 0);
 #else
     std::array<std::byte, 1> buf;
     io_handle::const_buffer_type buf2(buf.data(), size_);
@@ -142,7 +144,44 @@ private:
 #endif
 };
 
-class CircularFile {
+class ScopedMappedFile {
+public:
+  ScopedMappedFile(const char *path, llfio::file_handle::extent_type size,
+                   llfio::mapped_file_handle::caching caching)
+      : fh_{llfio::mapped_file({}, path, llfio::mapped_file_handle::mode::write,
+                               llfio::mapped_file_handle::creation::always_new,
+                               caching)
+                .value()},
+        size_{size} {
+    fh_.truncate(size).value();
+
+    alignas(4096) std::array<std::byte, 1024 * 1024> buf;
+    buf.fill(std::byte{0});
+
+    std::vector<llfio::io_handle::const_buffer_type> v(
+        size / buf.size(), {buf.data(), buf.size()});
+    ::WriteAll(fh_, {v, 0});
+  }
+
+  ~ScopedMappedFile() { llfio::unlink(fh_).value(); }
+
+  void WriteAll(llfio::file_handle::extent_type offset,
+                io_handle::const_buffer_type buffer) {
+    ::WriteAll(fh_, offset, buffer);
+  }
+
+  void Flush() {
+    int ret = msync(fh_.address(), size_, MS_SYNC);
+    (void)ret;
+    assert(ret == 0);
+  }
+
+private:
+  llfio::mapped_file_handle fh_;
+  llfio::file_handle::extent_type size_;
+};
+
+template <class FILE> class CircularFile {
 public:
   CircularFile(const char *file_name, llfio::file_handle::extent_type size,
                llfio::handle::caching caching)
@@ -164,7 +203,7 @@ public:
   void Flush() { file_.Flush(); }
 
 private:
-  ScopedFile file_;
+  FILE file_;
   const llfio::file_handle::extent_type size_;
   llfio::io_handle::extent_type offset_{0};
 };
@@ -243,7 +282,8 @@ public:
   }
 
 private:
-  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::reads};
+  CircularFile<ScopedFile> file_{kFileName, kFileSize,
+                                 llfio::handle::caching::reads};
   std::atomic<size_t> committed_lsn_{0};
   std::mutex mutex_;
 };
@@ -295,7 +335,8 @@ private:
   std::atomic<size_t> lsn_{0};
   std::atomic<size_t> committed_lsn_{0};
   AlignedBuffer buffer_{kBufferSize, kAlignment};
-  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::reads};
+  CircularFile<ScopedFile> file_{kFileName, kFileSize,
+                                 llfio::handle::caching::reads};
 };
 
 class RedoOverlappedFsync final : public Redo {
@@ -329,7 +370,48 @@ public:
   }
 
 private:
-  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::all};
+  CircularFile<ScopedFile> file_{kFileName, kFileSize,
+                                 llfio::handle::caching::all};
+  size_t lsn_{0};
+  std::atomic<size_t> committed_lsn_{0};
+  std::mutex mutex_;
+};
+
+class RedoOverlappedMsync final : public Redo {
+public:
+  RedoOverlappedMsync() { file_.Flush(); }
+
+  std::string_view Name() final { return "RedoOverlappedMsync"; };
+
+  size_t Append(tcb::span<std::byte> buffer) final {
+    std::lock_guard<std::mutex> _(mutex_);
+    file_.Append({buffer.data(), buffer.size()});
+    return ++lsn_;
+  }
+
+  void Commit(size_t lsn) final {
+    if (lsn <= committed_lsn_.load(std::memory_order_relaxed))
+      return;
+
+    file_.Flush();
+
+    for (;;) {
+      auto stored_lsn = committed_lsn_.load(std::memory_order_relaxed);
+
+      if (lsn <= stored_lsn)
+        break;
+
+      committed_lsn_.compare_exchange_weak(stored_lsn, lsn);
+    }
+  }
+
+  size_t CommitsHandled() const final {
+    return committed_lsn_.load(std::memory_order_relaxed);
+  }
+
+private:
+  CircularFile<ScopedMappedFile> file_{kFileName, kFileSize,
+                                       llfio::handle::caching::all};
   size_t lsn_{0};
   std::atomic<size_t> committed_lsn_{0};
   std::mutex mutex_;
@@ -369,7 +451,8 @@ private:
   std::mutex flush_mutex_;
   std::atomic<size_t> committed_lsn_{0};
 
-  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::all};
+  CircularFile<ScopedFile> file_{kFileName, kFileSize,
+                                 llfio::handle::caching::all};
 };
 
 class RedoODirectSparse final : public Redo {
@@ -404,7 +487,8 @@ private:
   std::atomic<size_t> committed_lsn_{0};
   AlignedBuffer buffer_{kBufferSize, kAlignment};
   std::array<std::byte, kAlignment> zeroes_;
-  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::none};
+  CircularFile<ScopedFile> file_{kFileName, kFileSize,
+                                 llfio::handle::caching::none};
 };
 
 class RedoODirectBuffer final : public Redo {
@@ -459,7 +543,8 @@ private:
   std::atomic<size_t> committed_lsn_{0};
   AlignedBuffer buffer_{kBufferSize, kAlignment};
   std::array<std::byte, kAlignment> zeroes_;
-  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::none};
+  CircularFile<ScopedFile> file_{kFileName, kFileSize,
+                                 llfio::handle::caching::none};
 };
 
 class RedoODirectTwoBuffers final : public Redo {
@@ -526,7 +611,8 @@ private:
   std::mutex flush_mutex_;
   std::atomic<size_t> committed_lsn_{0};
   std::array<std::byte, kAlignment> zeroes_;
-  CircularFile file_{kFileName, kFileSize, llfio::handle::caching::none};
+  CircularFile<ScopedFile> file_{kFileName, kFileSize,
+                                 llfio::handle::caching::none};
 };
 
 void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
@@ -590,5 +676,6 @@ int main() {
   Test<RedoODirectBuffer>();
   Test<RedoODirectTwoBuffers>();
   Test<RedoOverlappedFsync>();
+  Test<RedoOverlappedMsync>();
   Test<RedoGroupCommit>();
 }
