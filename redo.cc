@@ -258,8 +258,10 @@ public:
 
   virtual std::string_view Name() = 0;
 
+  // Should be thread-safe.
   virtual size_t Append(tcb::span<std::byte> buffer) = 0;
 
+  // Should be thread-safe.
   virtual void Commit(size_t lsn) = 0;
 
   virtual size_t CommitsHandled() const = 0;
