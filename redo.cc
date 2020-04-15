@@ -617,6 +617,47 @@ private:
                                  llfio::handle::caching::none};
 };
 
+class RedoSyncTLSBuffer final : public Redo {
+public:
+  std::string_view Name() final { return "RedoSyncTLSBuffer"; };
+
+  size_t Append(tcb::span<std::byte> buffer) final {
+    tls_buffer.insert(tls_buffer.end(), buffer.begin(), buffer.end());
+    ++tls_count;
+
+    return lsn_.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+  void Commit(size_t lsn) final {
+    std::lock_guard<std::mutex> _(mutex_);
+
+    file_.Append({tls_buffer.data(), tls_buffer.size()});
+    committed_lsn_.store(committed_lsn_.load(std::memory_order_relaxed) +
+                             tls_count,
+                         std::memory_order_relaxed);
+
+    tls_buffer.clear();
+    tls_count = 0;
+  }
+
+  size_t CommitsHandled() const final {
+    return committed_lsn_.load(std::memory_order_relaxed);
+  }
+
+private:
+  static thread_local std::vector<std::byte> tls_buffer;
+  static thread_local size_t tls_count;
+
+  std::mutex mutex_;
+  std::atomic<size_t> lsn_{0};
+  std::atomic<size_t> committed_lsn_{0};
+  CircularFile<ScopedFile> file_{kFileName, kFileSize,
+                                 llfio::handle::caching::reads};
+};
+
+thread_local std::vector<std::byte> RedoSyncTLSBuffer::tls_buffer;
+thread_local size_t RedoSyncTLSBuffer::tls_count = 0;
+
 void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
   std::array<std::byte, 2000> buffer;
   buffer.fill(b);
@@ -672,6 +713,7 @@ int main() {
              kDuration.count());
   fmt::print("\n");
 
+  Test<RedoSyncTLSBuffer>();
   Test<RedoSync>();
   Test<RedoSyncBuffer>();
   Test<RedoODirectSparse>();
