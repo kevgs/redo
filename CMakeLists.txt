@@ -10,10 +10,11 @@ add_subdirectory(fmt)
 add_subdirectory(llfio)
 
 add_executable(redo redo.cc)
-target_include_directories(redo PUBLIC
+target_include_directories(redo PRIVATE
   include
   fmt/include
   llfio/include
-  build/quickcpplib/include
-  build/outcome/include)
-target_link_libraries(redo PUBLIC fmt::fmt pthread dl)
+  ${CMAKE_CURRENT_BINARY_DIR}/quickcpplib/include
+  ${CMAKE_CURRENT_BINARY_DIR}/outcome/include
+)
+target_link_libraries(redo PRIVATE fmt::fmt pthread dl)
