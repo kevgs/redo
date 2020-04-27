@@ -671,7 +671,8 @@ void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
 
   // One iteration is one use transaction.
   while (!st.stop_requested()) {
-    size_t how_much_appends = uniform_dist(e1);
+    size_t how_much_appends = uniform_dist(e1) + 1;
+    assert(how_much_append > 0);
 
     // User transaction consists of several MTR.
     size_t lsn = 0;
