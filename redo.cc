@@ -208,6 +208,30 @@ private:
   llfio::io_handle::extent_type offset_{0};
 };
 
+class AppendFile {
+public:
+  AppendFile(const char *file_name, llfio::file_handle::extent_type,
+             llfio::handle::caching caching)
+      : fh_(llfio::file({}, file_name, llfio::handle::mode::append,
+                        llfio::handle::creation::always_new, caching)
+                .value()) {}
+
+  ~AppendFile() { llfio::unlink(fh_).value(); }
+
+  void Append(llfio::io_handle::const_buffer_type buf) {
+    ::WriteAll(fh_, 0, buf);
+  }
+
+  void Flush() {
+    int ret = fsync(fh_.native_handle().fd);
+    (void)ret;
+    assert(ret == 0);
+  }
+
+private:
+  llfio::file_handle fh_;
+};
+
 class AlignedBuffer {
 public:
   AlignedBuffer(size_t capacity, size_t alignment)
@@ -267,7 +291,7 @@ public:
   virtual size_t CommitsHandled() const = 0;
 };
 
-class RedoSync final : public Redo {
+template <class FILE> class RedoSync final : public Redo {
 public:
   std::string_view Name() final { return "RedoSync"; };
 
@@ -284,13 +308,12 @@ public:
   }
 
 private:
-  CircularFile<ScopedFile> file_{kFileName, kFileSize,
-                                 llfio::handle::caching::reads};
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::reads};
   std::atomic<size_t> committed_lsn_{0};
   std::mutex mutex_;
 };
 
-class RedoSyncBuffer final : public Redo {
+template <class FILE> class RedoSyncBuffer final : public Redo {
 public:
   std::string_view Name() final { return "RedoSyncBuffer"; };
 
@@ -337,11 +360,10 @@ private:
   std::atomic<size_t> lsn_{0};
   std::atomic<size_t> committed_lsn_{0};
   AlignedBuffer buffer_{kBufferSize, kAlignment};
-  CircularFile<ScopedFile> file_{kFileName, kFileSize,
-                                 llfio::handle::caching::reads};
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::reads};
 };
 
-class RedoOverlappedFsync final : public Redo {
+template <class FILE> class RedoOverlappedFsync final : public Redo {
 public:
   std::string_view Name() final { return "RedoOverlappedFsync"; };
 
@@ -372,14 +394,13 @@ public:
   }
 
 private:
-  CircularFile<ScopedFile> file_{kFileName, kFileSize,
-                                 llfio::handle::caching::all};
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::all};
   size_t lsn_{0};
   std::atomic<size_t> committed_lsn_{0};
   std::mutex mutex_;
 };
 
-class RedoOverlappedMsync final : public Redo {
+template <class FILE> class RedoOverlappedMsync final : public Redo {
 public:
   RedoOverlappedMsync() { file_.Flush(); }
 
@@ -412,14 +433,13 @@ public:
   }
 
 private:
-  CircularFile<ScopedMappedFile> file_{kFileName, kFileSize,
-                                       llfio::handle::caching::all};
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::all};
   size_t lsn_{0};
   std::atomic<size_t> committed_lsn_{0};
   std::mutex mutex_;
 };
 
-class RedoGroupCommit final : public Redo {
+template <class FILE> class RedoGroupCommit final : public Redo {
 public:
   std::string_view Name() final { return "RedoGroupCommit"; };
 
@@ -453,11 +473,10 @@ private:
   std::mutex flush_mutex_;
   std::atomic<size_t> committed_lsn_{0};
 
-  CircularFile<ScopedFile> file_{kFileName, kFileSize,
-                                 llfio::handle::caching::all};
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::all};
 };
 
-class RedoODirectSparse final : public Redo {
+template <class FILE> class RedoODirectSparse final : public Redo {
 public:
   RedoODirectSparse() { zeroes_.fill(std::byte{0}); }
 
@@ -489,11 +508,10 @@ private:
   std::atomic<size_t> committed_lsn_{0};
   AlignedBuffer buffer_{kBufferSize, kAlignment};
   std::array<std::byte, kAlignment> zeroes_;
-  CircularFile<ScopedFile> file_{kFileName, kFileSize,
-                                 llfio::handle::caching::none};
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::none};
 };
 
-class RedoODirectBuffer final : public Redo {
+template <class FILE> class RedoODirectBuffer final : public Redo {
 public:
   RedoODirectBuffer() { zeroes_.fill(std::byte{0}); }
 
@@ -545,11 +563,10 @@ private:
   std::atomic<size_t> committed_lsn_{0};
   AlignedBuffer buffer_{kBufferSize, kAlignment};
   std::array<std::byte, kAlignment> zeroes_;
-  CircularFile<ScopedFile> file_{kFileName, kFileSize,
-                                 llfio::handle::caching::none};
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::none};
 };
 
-class RedoODirectTwoBuffers final : public Redo {
+template <class FILE> class RedoODirectTwoBuffers final : public Redo {
 public:
   RedoODirectTwoBuffers() { zeroes_.fill(std::byte{0}); }
 
@@ -613,11 +630,10 @@ private:
   std::mutex flush_mutex_;
   std::atomic<size_t> committed_lsn_{0};
   std::array<std::byte, kAlignment> zeroes_;
-  CircularFile<ScopedFile> file_{kFileName, kFileSize,
-                                 llfio::handle::caching::none};
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::none};
 };
 
-class RedoSyncTLSBuffer final : public Redo {
+template <class FILE> class RedoSyncTLSBuffer final : public Redo {
 public:
   std::string_view Name() final { return "RedoSyncTLSBuffer"; };
 
@@ -630,6 +646,8 @@ public:
 
   void Commit(size_t lsn) final {
     std::lock_guard<std::mutex> _(mutex_);
+
+    assert(tls_buffer.empty() == false);
 
     file_.Append({tls_buffer.data(), tls_buffer.size()});
     committed_lsn_.store(committed_lsn_.load(std::memory_order_relaxed) +
@@ -651,12 +669,13 @@ private:
   std::mutex mutex_;
   std::atomic<size_t> lsn_{0};
   std::atomic<size_t> committed_lsn_{0};
-  CircularFile<ScopedFile> file_{kFileName, kFileSize,
-                                 llfio::handle::caching::reads};
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::reads};
 };
 
-thread_local std::vector<std::byte> RedoSyncTLSBuffer::tls_buffer;
-thread_local size_t RedoSyncTLSBuffer::tls_count = 0;
+template <class FILE>
+thread_local std::vector<std::byte> RedoSyncTLSBuffer<FILE>::tls_buffer;
+template <class FILE>
+thread_local size_t RedoSyncTLSBuffer<FILE>::tls_count = 0;
 
 void ThreadFunction(std::stop_token st, std::byte b, Redo &redo) {
   std::array<std::byte, 2000> buffer;
@@ -714,13 +733,32 @@ int main() {
              kDuration.count());
   fmt::print("\n");
 
-  Test<RedoSyncTLSBuffer>();
-  Test<RedoSync>();
-  Test<RedoSyncBuffer>();
-  Test<RedoODirectSparse>();
-  Test<RedoODirectBuffer>();
-  Test<RedoODirectTwoBuffers>();
-  Test<RedoOverlappedFsync>();
-  Test<RedoOverlappedMsync>();
-  Test<RedoGroupCommit>();
+  {
+    fmt::print("Circular file:\n");
+    using File = CircularFile<ScopedFile>;
+    Test<RedoSyncTLSBuffer<File>>();
+    Test<RedoSync<File>>();
+    Test<RedoSyncBuffer<File>>();
+    Test<RedoODirectSparse<File>>();
+    Test<RedoODirectBuffer<File>>();
+    Test<RedoODirectTwoBuffers<File>>();
+    Test<RedoOverlappedFsync<File>>();
+    Test<RedoOverlappedMsync<CircularFile<ScopedMappedFile>>>();
+    Test<RedoGroupCommit<File>>();
+  }
+
+  fmt::print("\n");
+
+  {
+    fmt::print("Append-only file:\n");
+    using File = AppendFile;
+    Test<RedoSyncTLSBuffer<File>>();
+    Test<RedoSync<File>>();
+    Test<RedoSyncBuffer<File>>();
+    Test<RedoODirectSparse<File>>();
+    Test<RedoODirectBuffer<File>>();
+    Test<RedoODirectTwoBuffers<File>>();
+    Test<RedoOverlappedFsync<File>>();
+    Test<RedoGroupCommit<File>>();
+  }
 }
