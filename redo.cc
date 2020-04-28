@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <llfio.hpp>
 
+#include "redo/group_commit_lock.hpp"
 #include "redo/jthread.hpp"
 #include "redo/span.hpp"
 #include "redo/stop_token.hpp"
@@ -476,6 +477,36 @@ private:
   FILE file_{kFileName, kFileSize, llfio::handle::caching::all};
 };
 
+template <class FILE> class RedoGroupCommitFancy final : public Redo {
+public:
+  std::string_view Name() final { return "RedoGroupCommitFancy"; };
+
+  size_t Append(tcb::span<std::byte> buffer) final {
+    std::lock_guard<std::mutex> _(append_mutex_);
+    file_.Append({buffer.data(), buffer.size()});
+    return ++lsn_;
+  }
+
+  void Commit(size_t lsn) final {
+    if (lock_.acquire(lsn) == redo::group_commit_lock::EXPIRED)
+      return;
+
+    file_.Flush();
+
+    lock_.release(lsn);
+  }
+
+  size_t CommitsHandled() const final { return lock_.value(); }
+
+private:
+  std::mutex append_mutex_;
+  size_t lsn_{0};
+
+  redo::group_commit_lock lock_;
+
+  FILE file_{kFileName, kFileSize, llfio::handle::caching::all};
+};
+
 template <class FILE> class RedoODirectSparse final : public Redo {
 public:
   RedoODirectSparse() { zeroes_.fill(std::byte{0}); }
@@ -745,6 +776,7 @@ int main() {
     Test<RedoOverlappedFsync<File>>();
     Test<RedoOverlappedMsync<CircularFile<ScopedMappedFile>>>();
     Test<RedoGroupCommit<File>>();
+    Test<RedoGroupCommitFancy<File>>();
   }
 
   fmt::print("\n");
@@ -760,5 +792,6 @@ int main() {
     Test<RedoODirectTwoBuffers<File>>();
     Test<RedoOverlappedFsync<File>>();
     Test<RedoGroupCommit<File>>();
+    Test<RedoGroupCommitFancy<File>>();
   }
 }
