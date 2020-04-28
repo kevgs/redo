@@ -729,12 +729,12 @@ template <class REDO> void Test() {
 } // namespace
 
 int main() {
-  fmt::print("File size: {}, threads: {}, duration: {}s\n", kFileSize, kThreads,
-             kDuration.count());
+  fmt::print("Threads: {}, duration: {}s\n", kThreads, kDuration.count());
   fmt::print("\n");
 
   {
-    fmt::print("Circular file:\n");
+    assert(kFileSize % (1024 * 1024) ==);
+    fmt::print("Circular file of size {}m:\n", kFileSize / 1024 / 1024);
     using File = CircularFile<ScopedFile>;
     Test<RedoSyncTLSBuffer<File>>();
     Test<RedoSync<File>>();
